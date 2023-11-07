@@ -165,6 +165,7 @@ SHELLY_GAS_MODELS = ["SHGS-1"]
 BLE_MIN_VERSION = AwesomeVersion("0.12.0-beta2")
 
 CONF_BLE_SCANNER_MODE = "ble_scanner_mode"
+CONF_PROFILE_NAME = "profile"
 
 
 class BLEScannerMode(StrEnum):

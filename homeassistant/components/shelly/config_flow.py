@@ -21,11 +21,16 @@ from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
     BLE_MIN_VERSION,
     CONF_BLE_SCANNER_MODE,
+    CONF_PROFILE_NAME,
     CONF_SLEEP_PERIOD,
     DOMAIN,
     LOGGER,
@@ -44,8 +49,7 @@ from .utils import (
     mac_address_from_name,
 )
 
-HOST_SCHEMA: Final = vol.Schema({vol.Required(CONF_HOST): str})
-
+HOST_SCHEMA: Final = vol.Schema({vol.Required(CONF_HOST, default="192.168.1.133"): str})
 
 BLE_SCANNER_OPTIONS = [
     BLEScannerMode.DISABLED,
@@ -81,12 +85,20 @@ async def validate_input(
             rpc_device.config
         ) or get_rpc_device_wakeup_period(rpc_device.status)
 
-        return {
+        device_info = {
             "title": rpc_device.name,
             CONF_SLEEP_PERIOD: sleep_period,
             "model": rpc_device.shelly.get("model"),
             "gen": 2,
         }
+        if "profile" in rpc_device.shelly:
+            device_info.update(
+                {
+                    "profiles": rpc_device.profiles,
+                    "profile": rpc_device.profile,
+                }
+            )
+        return device_info
 
     # Gen1
     coap_context = await get_coap_context(hass)
@@ -111,6 +123,7 @@ class ShellyConfigFlow(ConfigFlow, domain=DOMAIN):
 
     host: str = ""
     info: dict[str, Any] = {}
+    credentials: dict[str, Any] = {}
     device_info: dict[str, Any] = {}
     entry: ConfigEntry | None = None
 
@@ -138,7 +151,7 @@ class ShellyConfigFlow(ConfigFlow, domain=DOMAIN):
                     return await self.async_step_credentials()
 
                 try:
-                    device_info = await validate_input(
+                    self.device_info = await validate_input(
                         self.hass, self.host, self.info, {}
                     )
                 except DeviceConnectionError:
@@ -147,20 +160,72 @@ class ShellyConfigFlow(ConfigFlow, domain=DOMAIN):
                     LOGGER.exception("Unexpected exception")
                     errors["base"] = "unknown"
                 else:
-                    if device_info["model"]:
+                    if self.device_info["model"]:
+                        if self.device_info.get("profiles"):
+                            return await self.async_step_profile()
                         return self.async_create_entry(
-                            title=device_info["title"],
+                            title=self.device_info["title"],
                             data={
                                 **user_input,
-                                CONF_SLEEP_PERIOD: device_info[CONF_SLEEP_PERIOD],
-                                "model": device_info["model"],
-                                "gen": device_info["gen"],
+                                CONF_SLEEP_PERIOD: self.device_info[CONF_SLEEP_PERIOD],
+                                "model": self.device_info["model"],
+                                "gen": self.device_info["gen"],
                             },
                         )
                     errors["base"] = "firmware_not_fully_provisioned"
 
         return self.async_show_form(
             step_id="user", data_schema=HOST_SCHEMA, errors=errors
+        )
+
+    async def async_step_profile(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Handle the profile step."""
+        errors = {}
+        if user_input is not None:
+            try:
+                device_info = await validate_input(
+                    self.hass,
+                    self.host,
+                    info=self.info,
+                    data=self.credentials,
+                )
+            except DeviceConnectionError:
+                errors["base"] = "cannot_connect"
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                data = {
+                    **user_input,
+                    **self.credentials,
+                    CONF_HOST: self.host,
+                    CONF_SLEEP_PERIOD: device_info[CONF_SLEEP_PERIOD],
+                    "model": device_info["model"],
+                    "gen": device_info["gen"],
+                }
+                # print(data)
+                return self.async_create_entry(
+                    title=device_info["title"],
+                    data=data,
+                )
+
+        return self.async_show_form(
+            step_id="profile",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_PROFILE_NAME,
+                        default=self.device_info["profile"],
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=list(self.device_info["profiles"].keys()),
+                            mode=SelectSelectorMode.DROPDOWN,
+                        ),
+                    )
+                }
+            ),
         )
 
     async def async_step_credentials(
@@ -183,7 +248,10 @@ class ShellyConfigFlow(ConfigFlow, domain=DOMAIN):
                 LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
+                self.credentials = user_input
                 if device_info["model"]:
+                    if self.device_info.get("profiles"):
+                        return await self.async_step_profile()
                     return self.async_create_entry(
                         title=device_info["title"],
                         data={
@@ -379,8 +447,11 @@ class OptionsFlowHandler(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Handle options flow."""
+        entry_data = get_entry_data(self.hass)[self.config_entry.entry_id]
+        if entry_data.rpc is None:
+            raise ValueError()
+        device = entry_data.rpc.device
         if user_input is not None:
-            entry_data = get_entry_data(self.hass)[self.config_entry.entry_id]
             if user_input[CONF_BLE_SCANNER_MODE] != BLEScannerMode.DISABLED and (
                 not entry_data.rpc
                 or AwesomeVersion(entry_data.rpc.device.version) < BLE_MIN_VERSION
@@ -389,23 +460,42 @@ class OptionsFlowHandler(OptionsFlow):
                     reason="ble_unsupported",
                     description_placeholders={"ble_min_version": BLE_MIN_VERSION},
                 )
+            profile_name = user_input[CONF_PROFILE_NAME]
+            await device.set_profile(profile_name)
             return self.async_create_entry(title="", data=user_input)
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_BLE_SCANNER_MODE,
+                    default=self.config_entry.options.get(
+                        CONF_BLE_SCANNER_MODE, BLEScannerMode.DISABLED
+                    ),
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=BLE_SCANNER_OPTIONS,
+                        translation_key=CONF_BLE_SCANNER_MODE,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    ),
+                )
+            }
+        )
+        if "profile" in device.shelly:
+            data_schema = data_schema.extend(
+                {
+                    vol.Required(
+                        CONF_PROFILE_NAME,
+                        default=device.profile,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=list(entry_data.rpc.device.profiles.keys()),
+                            mode=SelectSelectorMode.DROPDOWN,
+                        ),
+                    )
+                }
+            )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_BLE_SCANNER_MODE,
-                        default=self.config_entry.options.get(
-                            CONF_BLE_SCANNER_MODE, BLEScannerMode.DISABLED
-                        ),
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=BLE_SCANNER_OPTIONS,
-                            translation_key=CONF_BLE_SCANNER_MODE,
-                        ),
-                    ),
-                }
-            ),
+            data_schema=data_schema,
         )

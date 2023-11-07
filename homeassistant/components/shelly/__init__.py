@@ -14,7 +14,7 @@ from aioshelly.exceptions import (
 from aioshelly.rpc_device import RpcDevice, RpcUpdateType
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
@@ -30,6 +30,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     CONF_COAP_PORT,
+    CONF_PROFILE_NAME,
     CONF_SLEEP_PERIOD,
     DATA_CONFIG_ENTRY,
     DEFAULT_COAP_PORT,
@@ -111,6 +112,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # config entry, core integration will try to configure that config entry with an
     # error. The config entry data for this custom component doesn't contain host
     # value, so if host isn't present, config entry will not be configured.
+
+    # from . import _async_setup_rpc_entry
+    # await _async_setup_rpc_entry(self.hass, device, self.config_entry)
+    # print("SHELLY async_setup_entry")
     if not entry.data.get(CONF_HOST):
         LOGGER.warning(
             (
@@ -277,6 +282,11 @@ async def _async_setup_rpc_entry(hass: HomeAssistant, entry: ConfigEntry) -> boo
         LOGGER.debug("Setting up online RPC device %s", entry.title)
         try:
             await device.initialize()
+            if entry.state == ConfigEntryState.SETUP_IN_PROGRESS and entry.data.get(
+                CONF_PROFILE_NAME
+            ):
+                await device.set_profile(entry.data[CONF_PROFILE_NAME])
+
         except (DeviceConnectionError, MacAddressMismatchError) as err:
             raise ConfigEntryNotReady(repr(err)) from err
         except InvalidAuthError as err:
@@ -300,6 +310,7 @@ async def _async_setup_rpc_entry(hass: HomeAssistant, entry: ConfigEntry) -> boo
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    # print("SHELLY async_unload_entry")
     shelly_entry_data = get_entry_data(hass)[entry.entry_id]
 
     # If device is present, block/rpc coordinator is not setup yet
